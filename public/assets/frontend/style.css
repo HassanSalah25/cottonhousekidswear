@@ -684,7 +684,7 @@ Version:1.0
 	font-weight:400;
 }
 .header.shop .nice-select .list li {
-	color: #666;
+	color: black;
 	border-radius: 0px;
 	font-size: 14px;
 	font-weight: 400;
@@ -2295,6 +2295,8 @@ span.price-dec {
 }
 .shop .nice-select .option.selected {
 	font-weight: 500;
+    background-color: red !important;
+    color: white ;
 }
 .shop .nice-select .list li{
 	color:#666;

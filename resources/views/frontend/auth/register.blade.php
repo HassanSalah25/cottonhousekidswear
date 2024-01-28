@@ -34,7 +34,7 @@
                             </div>
                         </form>
                         <div class="other-links">
-                            <span>{{translate('Or register with')}}</span><a href="#"><i class="fa fa-facebook-f"></i></a><a href="#"><i class="fa fa-google"></i></a><a href="#"><i class="fa fa-linkedin"></i></a>
+                            <span>{{translate('Or login with')}}</span><a href="{{route('social.login','facebook')}}"><i class="fa fa-facebook-f"></i></a><a href="{{route('social.login','google')}}"><i class="fa fa-google"></i></a>
                         </div>
                     </div>
                 </div>

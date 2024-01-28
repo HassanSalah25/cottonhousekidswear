@@ -9,7 +9,7 @@
                 <div class="col-md-6 mt-3"
                      style="border-left: 5px solid red; padding: 10px"
                 >
-                    <p class="text-dark">{{auth()->user()->addresses->last()->address}}</p>
+                    <p class="text-dark">{{auth()->user()->addresses->last()?->address}}</p>
                 </div>
                 <div class="col-md-3"
                 >
@@ -22,9 +22,9 @@
         <form action="{{route('checkout.order.store')}}" method="POST">
             @csrf
             <div class="row">
-                <input name="shipping_address_id" type="hidden" value="{{auth()->user()->addresses->last()->id}}">
+                <input name="shipping_address_id" type="hidden" value="{{auth()->user()->addresses->last()?->id}}">
                 <input name="delivery_type" type="hidden" value="standard">
-                <input name="coupon_codes" type="hidden" value="{{auth()->user()->addresses->last()->id}}">
+                <input name="coupon_codes" type="hidden" value="{{auth()->user()->addresses->last()?->id}}">
                 <input name="payment_type" type="hidden" value="cash_on_delivery">
                 <div class="col-md-8">
                     <div class="card p-4" id="cards">
