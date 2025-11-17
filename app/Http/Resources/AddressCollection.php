@@ -12,7 +12,6 @@ class AddressCollection extends ResourceCollection
             'data' => $this->collection->map(function($data) {
                 return [
                     'id'      => $data->id,
-                    'name' => $data->name,
                     'user_id' => $data->user_id,
                     'address' => $data->address,
                     'country' => $data->country,

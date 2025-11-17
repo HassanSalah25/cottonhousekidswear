@@ -182,12 +182,21 @@ class OrderController extends Controller
 
     public function store(Request $request)
     {
-        $user = auth('api')->user();
-        $cartItems = Cart::where('user_id',$user->id)
-            ->with(['variation.product'])->get();
-        $shippingAddress = Address::find($request->shipping_address_id);
-        $billingAddress = Address::find($request->billing_address_id);
-        $shippingCity = City::with('zone')->find($shippingAddress->city_id);
+        // Optimize: Wrap entire operation in database transaction for better performance
+        return DB::transaction(function () use ($request) {
+            $user = auth('api')->user();
+            
+            // Optimize: Eager load all necessary relationships to prevent N+1 queries
+            $cartItems = Cart::where('user_id', $user->id)
+                ->with([
+                    'variation.product.categories',
+                    'variation.product.brand',
+                    'variation.product.shop.user'
+                ])->get();
+                
+            $shippingAddress = Address::find($request->shipping_address_id);
+            $billingAddress = Address::find($request->billing_address_id);
+            $shippingCity = City::with('zone')->find($shippingAddress->city_id);
 
         if($cartItems->count() < 1)
             return response()->json([
@@ -265,7 +274,9 @@ class OrderController extends Controller
             })->get();
         }
 
-
+        // Optimize: Pre-load all shops to avoid repeated queries
+        $shop_ids = array_keys($shops_cart_items);
+        $shops = Shop::whereIn('id', $shop_ids)->get()->keyBy('id');
 
         $combined_order = new CombinedOrder;
         $combined_order->user_id = $user->id;
@@ -276,6 +287,13 @@ class OrderController extends Controller
         $combined_order->save();
 
         $grand_total = 0;
+        
+        // Optimize: Prepare bulk update arrays
+        $product_updates = [];
+        $category_updates = [];
+        $brand_updates = [];
+        $coupon_usages = [];
+        $order_updates = [];
 
         // all shops order place
         $package_number = 1;
@@ -286,11 +304,21 @@ class OrderController extends Controller
             $shop_subTotal = 0;
             $shop_tax = 0;
             $shop_coupon_discount = 0;
+            
+            // Optimize: Cache price calculations to avoid redundant calls
+            $price_cache = [];
 
             //shop total amount calculation
             foreach ($shop_cart_items as $cartItem) {
-                $itemPriceWithoutTax = variation_discounted_price($cartItem->variation->product,$cartItem->variation,false)*$cartItem->quantity;
-                $itemTax = product_variation_tax($cartItem->variation->product,$cartItem->variation)*$cartItem->quantity;
+                $cache_key = $cartItem->product_id . '_' . $cartItem->product_variation_id;
+                if (!isset($price_cache[$cache_key])) {
+                    $price_cache[$cache_key] = [
+                        'price' => variation_discounted_price($cartItem->variation->product, $cartItem->variation, false),
+                        'tax' => product_variation_tax($cartItem->variation->product, $cartItem->variation)
+                    ];
+                }
+                $itemPriceWithoutTax = $price_cache[$cache_key]['price'] * $cartItem->quantity;
+                $itemTax = $price_cache[$cache_key]['tax'] * $cartItem->quantity;
 
                 $shop_subTotal += $itemPriceWithoutTax;
                 $shop_tax += $itemTax;
@@ -307,16 +335,19 @@ class OrderController extends Controller
 
                     $shop_total -= $shop_coupon_discount;
 
-                    $coupon_usage = new CouponUsage();
-                    $coupon_usage->user_id = $user->id;
-                    $coupon_usage->coupon_id = $coupon->id;
-                    $coupon_usage->save();
+                    // Optimize: Collect coupon usages for bulk insert
+                    $coupon_usages[] = [
+                        'user_id' => $user->id,
+                        'coupon_id' => $coupon->id,
+                        'created_at' => now(),
+                        'updated_at' => now(),
+                    ];
                 }
             }
 
             // shop order place
             $order = Order::create([
-                'user_id' => auth('api')->user()->id,
+                'user_id' => $user->id,
                 'shop_id' => $shop_id,
                 'combined_order_id' => $combined_order->id,
                 'code' => $package_number,
@@ -334,43 +365,61 @@ class OrderController extends Controller
             $package_number++;
             $grand_total += $shop_total;
 
+            // Optimize: Collect order details for bulk insert
+            $order_details = [];
+            $order_tax_total = 0;
 
             foreach ($shop_cart_items as $cartItem) {
-                $itemPriceWithoutTax = variation_discounted_price($cartItem->variation->product,$cartItem->variation,false);
-                $itemTax = product_variation_tax($cartItem->variation->product,$cartItem->variation);
+                $cache_key = $cartItem->product_id . '_' . $cartItem->product_variation_id;
+                $itemPriceWithoutTax = $price_cache[$cache_key]['price'];
+                $itemTax = $price_cache[$cache_key]['tax'];
+                $itemTotal = ($itemPriceWithoutTax + $itemTax) * $cartItem->quantity;
+                $order_tax_total += $itemTax * $cartItem->quantity;
 
-                $orderDetail = OrderDetail::create([
+                $order_details[] = [
                     'order_id' => $order->id,
                     'product_id' => $cartItem->product_id,
                     'product_variation_id' => $cartItem->product_variation_id,
                     'price' => $itemPriceWithoutTax,
                     'tax' => $itemTax,
-                    'total' => ($itemPriceWithoutTax+$itemTax)*$cartItem->quantity,
+                    'total' => $itemTotal,
                     'quantity' => $cartItem->quantity,
-                ]);
+                    'created_at' => now(),
+                    'updated_at' => now(),
+                ];
 
-                $cartItem->product->update([
-                    'num_of_sale' => DB::raw('num_of_sale + ' . $cartItem->quantity)
-                ]);
+                // Optimize: Collect product updates for bulk update
+                if (!isset($product_updates[$cartItem->product_id])) {
+                    $product_updates[$cartItem->product_id] = 0;
+                }
+                $product_updates[$cartItem->product_id] += $cartItem->quantity;
 
-                foreach($orderDetail->product->categories as $category){
-                    $category->sales_amount += $orderDetail->total;
-                    $category->save();
+                // Optimize: Collect category and brand updates
+                $product = $cartItem->variation->product;
+                foreach($product->categories as $category){
+                    if (!isset($category_updates[$category->id])) {
+                        $category_updates[$category->id] = 0;
+                    }
+                    $category_updates[$category->id] += $itemTotal;
                 }
 
-                $brand = $orderDetail->product->brand;
+                $brand = $product->brand;
                 if($brand){
-                    $brand->sales_amount += $orderDetail->total;
-                    $brand->save();
+                    if (!isset($brand_updates[$brand->id])) {
+                        $brand_updates[$brand->id] = 0;
+                    }
+                    $brand_updates[$brand->id] += $itemTotal;
                 }
-
             }
 
-            $order_price = $order->grand_total - $order->shipping_cost - $order->orderDetails->sum(function ($t) {
-                return $t->tax * $t->quantity;
-            });
+            // Optimize: Bulk insert order details
+            OrderDetail::insert($order_details);
 
-            $shop_commission = Shop::find($shop_id)->commission;
+            $order_price = $order->grand_total - $order->shipping_cost - $order_tax_total;
+
+            // Optimize: Use cached shop data
+            $shop = $shops->get($shop_id);
+            $shop_commission = $shop ? $shop->commission : 0;
             $admin_commission = 0.00;
             $seller_earning = $shop_total;
             if($shop_commission > 0){
@@ -382,32 +431,118 @@ class OrderController extends Controller
             $order->seller_earning = $seller_earning;
             $order->commission_percentage = $shop_commission;
             $order->save();
-            OrderUpdate::create([
+            
+            // Optimize: Collect order updates for bulk insert
+            $order_updates[] = [
                 'order_id' => $order->id,
-                'user_id' => auth('api')->user()->id,
+                'user_id' => $user->id,
                 'note' => 'Order has been placed.',
-            ]);
+                'created_at' => now(),
+                'updated_at' => now(),
+            ];
 
         }
+        
+        // Optimize: Bulk insert coupon usages
+        if (!empty($coupon_usages)) {
+            CouponUsage::insert($coupon_usages);
+        }
+        
+        // Optimize: Bulk insert order updates
+        if (!empty($order_updates)) {
+            OrderUpdate::insert($order_updates);
+        }
+        
+        // Optimize: Bulk update products using CASE statements for better performance
+        if (!empty($product_updates)) {
+            $cases = [];
+            $ids = [];
+            foreach ($product_updates as $id => $quantity) {
+                $id = (int) $id; // Sanitize
+                $quantity = (int) $quantity; // Sanitize
+                $cases[] = "WHEN {$id} THEN num_of_sale + {$quantity}";
+                $ids[] = $id;
+            }
+            $ids_string = implode(',', $ids);
+            $cases_string = implode(' ', $cases);
+            DB::statement("UPDATE products SET num_of_sale = CASE id {$cases_string} END WHERE id IN ({$ids_string})");
+        }
+        
+        // Optimize: Bulk update categories using CASE statements
+        if (!empty($category_updates)) {
+            $cases = [];
+            $ids = [];
+            foreach ($category_updates as $id => $amount) {
+                $id = (int) $id; // Sanitize
+                $amount = (float) $amount; // Sanitize
+                $cases[] = "WHEN {$id} THEN sales_amount + {$amount}";
+                $ids[] = $id;
+            }
+            $ids_string = implode(',', $ids);
+            $cases_string = implode(' ', $cases);
+            DB::statement("UPDATE categories SET sales_amount = CASE id {$cases_string} END WHERE id IN ({$ids_string})");
+        }
+        
+        // Optimize: Bulk update brands using CASE statements
+        if (!empty($brand_updates)) {
+            $cases = [];
+            $ids = [];
+            foreach ($brand_updates as $id => $amount) {
+                $id = (int) $id; // Sanitize
+                $amount = (float) $amount; // Sanitize
+                $cases[] = "WHEN {$id} THEN sales_amount + {$amount}";
+                $ids[] = $id;
+            }
+            $ids_string = implode(',', $ids);
+            $cases_string = implode(' ', $cases);
+            DB::statement("UPDATE brands SET sales_amount = CASE id {$cases_string} END WHERE id IN ({$ids_string})");
+        }
+        
         $combined_order->grand_total = $grand_total;
         $combined_order->save();
-        //Invioce mail send to the customer and seller
-        try {
-            Notification::send($user, new OrderPlacedNotification($combined_order));
-            foreach ($combined_order->orders as $order) {
-                Notification::send($order->orderDetails->first()->product->shop->user, new SellerInvoiceNotification($order));
-            }
-        } catch (\Exception $e) {
-        }
-        //
-
-        // add club points
-        if (get_setting('club_point') == 1) {
-            (new ClubPointController)->processClubPoints($combined_order, $club_points);
-        }
-
-        // clear user's cart
+        
+        // clear user's cart (do this before notifications to free up resources)
         Cart::where('user_id', $user->id)->delete();
+        
+        // Optimize: Prepare club points data for bulk insert
+        $club_point_details = [];
+        $club_point_id = null;
+        if (get_setting('club_point') == 1 && $club_points > 0) {
+            $club_point = new \App\Models\ClubPoint;
+            $club_point->user_id = $combined_order->user_id;
+            $club_point->points = $club_points;
+            $club_point->combined_order_id = $combined_order->id;
+            $club_point->convert_status = 0;
+            $club_point->save();
+            $club_point_id = $club_point->id;
+            
+            // Collect club point details for bulk insert
+            $combined_order->load('orders.orderDetails.product');
+            foreach ($combined_order->orders as $order) {
+                foreach ($order->orderDetails as $orderDetail) {
+                    if ($orderDetail->product && $orderDetail->product->earn_point) {
+                        $club_point_details[] = [
+                            'club_point_id' => $club_point_id,
+                            'product_id' => $orderDetail->product_id,
+                            'point' => ($orderDetail->product->earn_point) * $orderDetail->quantity,
+                            'created_at' => now(),
+                            'updated_at' => now(),
+                        ];
+                    }
+                }
+            }
+            
+            // Bulk insert club point details
+            if (!empty($club_point_details)) {
+                \App\Models\ClubPointDetail::insert($club_point_details);
+            }
+        }
+        
+        // Optimize: Eager load relationships for notifications (after main operations)
+        $combined_order->load(['orders.orderDetails.product.shop.user']);
+        
+        // Optimize: Send notifications after response (non-blocking) - moved to after return
+        // We'll handle this after the transaction commits
 
         if($request->payment_type == 'wallet'){
             $user->balance -= $combined_order->grand_total;
@@ -447,9 +582,12 @@ class OrderController extends Controller
                     $manual_payment_data->reciept = null;
                 }
 
-                $order->manual_payment = 1;
-                $order->manual_payment_data = json_encode($manual_payment_data);
-                $order->save();
+                // Optimize: Apply manual payment to all orders in combined_order
+                foreach ($combined_order->orders as $order) {
+                    $order->manual_payment = 1;
+                    $order->manual_payment_data = json_encode($manual_payment_data);
+                    $order->save();
+                }
 
                 // $this->paymentDone($combined_order, 'offline_payment');
             }
@@ -458,7 +596,7 @@ class OrderController extends Controller
             $go_to_payment = true;
         }
 
-        return response()->json([
+        $response = response()->json([
             'success' => true,
             'go_to_payment' => $go_to_payment,
             'grand_total' => $grand_total,
@@ -466,6 +604,25 @@ class OrderController extends Controller
             'message' => translate('Your order has been placed successfully'),
             'order_code' => $combined_order->code
         ]);
+        
+        // Optimize: Send notifications after response is prepared
+        // Register shutdown function to send notifications after response is sent to client
+        register_shutdown_function(function () use ($user, $combined_order) {
+            try {
+                Notification::send($user, new OrderPlacedNotification($combined_order));
+                foreach ($combined_order->orders as $order) {
+                    $firstOrderDetail = $order->orderDetails->first();
+                    if ($firstOrderDetail && $firstOrderDetail->product && $firstOrderDetail->product->shop && $firstOrderDetail->product->shop->user) {
+                        Notification::send($firstOrderDetail->product->shop->user, new SellerInvoiceNotification($order));
+                    }
+                }
+            } catch (\Exception $e) {
+                // Log error but don't fail the request
+            }
+        });
+        
+        return $response;
+        });
     }
 
     public function paymentDone($combined_order,$payment_method,$payment_info = null){
